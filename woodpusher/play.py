@@ -14,7 +14,7 @@ import chess
 import torch
 
 from .tokenizer import Tokenizer
-from .evals.common import load_model, pick_move
+from .evals.common import load_model, pick_move, sampling_generator
 
 
 def render(board, ascii_board):
@@ -44,17 +44,20 @@ def main():
     ap.add_argument("--selfplay", action="store_true", help="model plays itself once and exits")
     ap.add_argument("--max-plies", type=int, default=300)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="fix the sampling RNG: same seed + same checkpoint + same inputs = same game")
     args = ap.parse_args()
 
     tok = Tokenizer()
     model, _ = load_model(args.ckpt, args.device)
+    gen = sampling_generator(args.device, args.seed)
     board = chess.Board()
 
     if args.selfplay:
         ids = tok.prefix_ids(args.model_elo, args.model_elo)
         sans, raw_illegal = [], 0
         while not board.is_game_over() and board.ply() < args.max_plies:
-            move, raw_id = pick_move(model, tok, ids, board, args.device, args.temperature)
+            move, raw_id = pick_move(model, tok, ids, board, args.device, args.temperature, generator=gen)
             if not (tok.is_move_id(raw_id) and chess.Move.from_uci(tok.tokens[raw_id]) in board.legal_moves):
                 raw_illegal += 1
             sans.append(board.san(move))
@@ -90,7 +93,7 @@ def main():
                 print("could not parse that as a legal move\n")
                 continue
         else:
-            move, raw_id = pick_move(model, tok, ids, board, args.device, args.temperature)
+            move, raw_id = pick_move(model, tok, ids, board, args.device, args.temperature, generator=gen)
             note = ""
             if not (tok.is_move_id(raw_id) and chess.Move.from_uci(tok.tokens[raw_id]) in board.legal_moves):
                 note = f"  (raw top-1 was illegal: {tok.tokens[raw_id]})"

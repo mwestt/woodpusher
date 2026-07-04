@@ -15,11 +15,11 @@ import chess.engine
 import torch
 
 from ..tokenizer import Tokenizer
-from .common import load_model, pick_move
+from .common import load_model, pick_move, sampling_generator
 
 
 def play_game(model, tok, engine, device, model_is_white, model_elo, engine_elo,
-              temperature, movetime, max_plies):
+              temperature, limit, max_plies, generator=None):
     board = chess.Board()
     welo = model_elo if model_is_white else engine_elo
     belo = engine_elo if model_is_white else model_elo
@@ -27,9 +27,9 @@ def play_game(model, tok, engine, device, model_is_white, model_elo, engine_elo,
 
     while not board.is_game_over() and board.ply() < max_plies:
         if (board.turn == chess.WHITE) == model_is_white:
-            move, _ = pick_move(model, tok, ids, board, device, temperature)
+            move, _ = pick_move(model, tok, ids, board, device, temperature, generator=generator)
         else:
-            move = engine.play(board, chess.engine.Limit(time=movetime)).move
+            move = engine.play(board, limit).move
         ids.append(tok.move_id(move.uci()))
         board.push(move)
 
@@ -50,8 +50,11 @@ def main():
     ap.add_argument("--model-elo", type=int, default=2200, help="conditioning bucket for the model's side")
     ap.add_argument("--temperature", type=float, default=0.3)
     ap.add_argument("--movetime", type=float, default=0.05)
+    ap.add_argument("--engine-nodes", type=int, default=0,
+                    help="limit engine by node count instead of time (deterministic engine play)")
     ap.add_argument("--max-plies", type=int, default=300)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--seed", type=int, default=None, help="fix model sampling RNG for reproducibility")
     args = ap.parse_args()
 
     engine_elo = max(1320, args.engine_elo)
@@ -63,12 +66,15 @@ def main():
     engine = chess.engine.SimpleEngine.popen_uci(args.stockfish)
     engine.configure({"UCI_LimitStrength": True, "UCI_Elo": engine_elo})
 
+    limit = (chess.engine.Limit(nodes=args.engine_nodes) if args.engine_nodes
+             else chess.engine.Limit(time=args.movetime))
+    gen = sampling_generator(args.device, args.seed)
     score = 0.0
     try:
         for g in range(args.games):
             s = play_game(model, tok, engine, args.device, g % 2 == 0,
                           args.model_elo, engine_elo, args.temperature,
-                          args.movetime, args.max_plies)
+                          limit, args.max_plies, generator=gen)
             score += s
             print(f"game {g + 1}/{args.games}: {'win' if s == 1 else 'draw' if s == 0.5 else 'loss'}"
                   f" ({'white' if g % 2 == 0 else 'black'}) running score {score}/{g + 1}")

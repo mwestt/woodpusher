@@ -51,11 +51,21 @@ def next_logits(model, ids, device):
     return logits[0, -1]
 
 
-def pick_move(model, tok, ids, board, device, temperature=0.0, mask_legal=True):
+def sampling_generator(device, seed):
+    """Seeded torch.Generator for reproducible nonzero-temperature games."""
+    if seed is None:
+        return None
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    return gen
+
+
+def pick_move(model, tok, ids, board, device, temperature=0.0, mask_legal=True, generator=None):
     """Choose the model's move for the current position.
 
     Returns (move, raw_argmax_token_id). `move` is a legal chess.Move when
     mask_legal, else whatever the raw choice decodes to (possibly None).
+    Pass a seeded `generator` to make temperature sampling reproducible.
     """
     logits = next_logits(model, ids, device)
     raw_id = int(logits.argmax())
@@ -69,7 +79,7 @@ def pick_move(model, tok, ids, board, device, temperature=0.0, mask_legal=True):
             chosen = int(masked.argmax())
         else:
             probs = torch.softmax(masked / temperature, dim=-1)
-            chosen = int(torch.multinomial(probs, 1))
+            chosen = int(torch.multinomial(probs, 1, generator=generator))
         return legal[chosen], raw_id
 
     if not tok.is_move_id(raw_id):
