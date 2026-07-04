@@ -1,16 +1,13 @@
 # woodpusher
 
-A language model that learns chess purely by reading games — built from
-scratch to walk the **full foundation-model lifecycle at hobby scale**: data
-pipeline, tokenizer, pretraining, evals, scaling ladder, and play.
+Woodpusher is a language model that learns chess purely by reading text-encoded games, built from
+scratch to learn the full foundation-model lifecycle at hobbyist scale. While chess is a game typically considered solved by SoTA RL models (citation here),
+a transformer based approach allows investigation from a language modelling perspective, and hopefully provides a toy model to investigate interesting properties
+surrounding interpretability and scaling laws. Future reserach directions include blending with RL post-training and (fill in).
 
-The name is chess slang for an enthusiastic-but-weak amateur. It is also a
-deliberate homage: this project is the spiritual successor to John Hamlen's
-**Woodpusher (1989)** — a sub-64K experimental chess program born as a
-university research project, campaigned at World Computer Chess Championships
-for two decades, and retired in the 2012 paper *"Game Over for the Woodpusher
-Experiment."* Same self-deprecating name, same scrappy-experiment spirit,
-new paradigm: where the original searched, this one predicts.
+The name is an homage to John Hamlen's
+**Woodpusher (1989)**, a sub-64K experimental chess program born as a
+university research project, and which campaigned at World Computer Chess Championships for two decades.
 
 ## Design decisions
 
@@ -54,7 +51,7 @@ The Elo-vs-Stockfish eval needs a [Stockfish binary](https://stockfishchess.org/
 uv run python -m woodpusher.evals.elo_vs_stockfish --ckpt runs/25m/best.pt --stockfish path\to\stockfish.exe --engine-elo 1400
 ```
 
-## The plan
+## Project plan
 
 1. [x] Data pipeline + tokenizer
 2. [ ] 5M smoke-test model (`--preset 5m`, needs ~120M tokens — a 2015-era month)
@@ -67,10 +64,10 @@ uv run python -m woodpusher.evals.elo_vs_stockfish --ckpt runs/25m/best.pt --sto
 
 | Preset | Params | Chinchilla tokens | Data needed | Hardware |
 |---|---|---|---|---|
-| smoke | ~1M | (3M, not Chinchilla) | 2013-01 dump | this laptop |
-| 5m | ~6M | 120M | ~1 month of 2015 | this laptop (RTX 4070, hours) |
-| 25m | ~28M | 560M | ~1 month of 2016-17 | this laptop (overnight) |
-| 100m | ~90M | 1.8B | ~1 month of 2018+ | rented A100/H100, ~$30–60 |
+| smoke | ~1M | (3M, not Chinchilla) | 2013-01 dump | local laptop |
+| 5m | ~6M | 120M | ~1 month of 2015 | local laptop (RTX 4070, hours) |
+| 25m | ~28M | 560M | ~1 month of 2016-17 | local laptop (overnight) |
+| 100m | ~90M | 1.8B | ~1 month of 2018+ | rented A100/H100?, ~$30–60 |
 
 Rules of thumb: training compute ≈ 6·params·tokens FLOPs; a game averages
 ~70 tokens; one recent monthly dump ≈ 8–10B tokens (far more than any rung
