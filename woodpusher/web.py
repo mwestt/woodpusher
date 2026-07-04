@@ -18,28 +18,67 @@ from urllib.parse import parse_qs, urlparse
 import chess
 import torch
 
-from .evals.common import load_model, pick_move
+from .evals.common import next_logits, pick_move
+from .model import ModelConfig, Transformer
 from .tokenizer import Tokenizer
 
 TOK = Tokenizer()
 INFER_LOCK = threading.Lock()
-_model_cache: dict[str, tuple[float, object]] = {}
+_model_cache: dict[str, tuple[float, object, int]] = {}
+
+# Fixed probe positions (move sequences from the start), polled against the
+# live checkpoint: watch beliefs sharpen as training runs.
+PROBES = [
+    ("opening choice", []),
+    ("reply to 1.e4", ["e2e4"]),
+    ("defend e5 as black", ["e2e4", "e7e5", "g1f3"]),
+    ("find Scholar's mate", ["e2e4", "e7e5", "f1c4", "f8c5", "d1h5", "g7g6"]),
+]
 
 
 def get_model(run_dir: Path, device: str):
-    ckpt = run_dir / "ckpt.pt"
-    if not ckpt.exists():
-        ckpt = run_dir / "best.pt"
-    mtime = ckpt.stat().st_mtime
-    key = str(ckpt)
+    ckpt_path = run_dir / "ckpt.pt"
+    if not ckpt_path.exists():
+        ckpt_path = run_dir / "best.pt"
+    mtime = ckpt_path.stat().st_mtime
+    key = str(ckpt_path)
     with INFER_LOCK:
         cached = _model_cache.get(key)
         if cached and cached[0] == mtime:
-            return cached[1]
-    model, _ = load_model(ckpt, device)
+            return cached[1], cached[2], mtime
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    cfg = ModelConfig(**ckpt["model_config"])
+    model = Transformer(cfg).to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    step = int(ckpt.get("step", 0))
     with INFER_LOCK:
-        _model_cache[key] = (mtime, model)
-    return model
+        _model_cache[key] = (mtime, model, step)
+    return model, step, mtime
+
+
+def compute_probes(model, device):
+    out = []
+    for label, moves in PROBES:
+        board = chess.Board()
+        for u in moves:
+            board.push(chess.Move.from_uci(u))
+        ids = TOK.prefix_ids(1800, 1800) + [TOK.move_id(u) for u in moves]
+        with INFER_LOCK:
+            logits = next_logits(model, ids, device)
+        probs = torch.softmax(logits.float(), dim=-1)
+        legal = {TOK.move_id(m.uci()): m for m in board.legal_moves}
+        legal_mass = float(probs[list(legal)].sum())
+        top = []
+        for i in probs.argsort(descending=True)[:5].tolist():
+            is_legal = i in legal
+            top.append({
+                "move": board.san(legal[i]) if is_legal else TOK.tokens[i],
+                "prob": float(probs[i]),
+                "legal": is_legal,
+            })
+        out.append({"label": label, "legal_mass": legal_mass, "top": top})
+    return out
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -77,6 +116,32 @@ class Handler(BaseHTTPRequestHandler):
                     params = json.loads(meta_path.read_text()).get("params")
                 runs.append({"name": d.name, "params": params})
             self._json(runs)
+        elif url.path == "/api/probe":
+            try:
+                run = parse_qs(url.query).get("run", [""])[0]
+                run_dir = self.runs_dir / run
+                model, step, mtime = get_model(run_dir, self.device)
+                hist_path = run_dir / "probes.jsonl"
+                history = []
+                if hist_path.exists():
+                    history = [json.loads(line) for line in hist_path.read_text().splitlines() if line]
+                if not history or history[-1]["mtime"] != mtime:
+                    probes = compute_probes(model, self.device)
+                    entry = {
+                        "mtime": mtime,
+                        "step": step,
+                        "avg_legal_mass": sum(p["legal_mass"] for p in probes) / len(probes),
+                        "probes": probes,
+                    }
+                    with open(hist_path, "a") as f:
+                        f.write(json.dumps(entry) + "\n")
+                    history.append(entry)
+                self._json({
+                    "history": [{"step": h["step"], "avg_legal_mass": h["avg_legal_mass"]} for h in history],
+                    "latest": history[-1],
+                })
+            except Exception as e:
+                self._json({"error": f"{type(e).__name__}: {e}"}, 500)
         elif url.path == "/api/log":
             run = parse_qs(url.query).get("run", [""])[0]
             log_path = self.runs_dir / run / "log.csv"
@@ -143,7 +208,7 @@ class Handler(BaseHTTPRequestHandler):
                     welo = your_elo if user_white else model_elo
                     belo = model_elo if user_white else your_elo
                 ids = TOK.prefix_ids(welo, belo) + [TOK.move_id(u) for u in moves]
-                model = get_model(self.runs_dir / req["run"], self.device)
+                model, _, _ = get_model(self.runs_dir / req["run"], self.device)
                 with INFER_LOCK:
                     mv, raw_id = pick_move(model, TOK, ids, board, self.device, temperature)
                 raw_ok = False
@@ -198,6 +263,10 @@ PAGE = r"""<!doctype html>
   canvas { background: #26262c; border: 1px solid #444; }
   #trainstats { font-size: 13px; color: #9c9; }
   .panel { min-width: 430px; }
+  .probe { margin-bottom: 10px; font-size: 13px; }
+  .row { display: flex; align-items: center; gap: 6px; font-size: 12px; margin: 1px 0; }
+  .mv { width: 70px; } .illegal { color: #e66; }
+  .bar { height: 10px; background: #5a9; } .pct { color: #888; }
 </style></head><body>
 
 <div class="panel">
@@ -222,8 +291,12 @@ PAGE = r"""<!doctype html>
 </div>
 
 <div class="panel">
-  <h2>training loss (polls log.csv of the selected run)</h2>
-  <canvas id="chart" width="460" height="300"></canvas>
+  <h2>probes — what the model believes right now (✗ = illegal)</h2>
+  <div id="probes"></div>
+  <h2>legal probability mass over training (avg across probes)</h2>
+  <canvas id="mass" width="460" height="110"></canvas>
+  <h2>training loss</h2>
+  <canvas id="chart" width="460" height="160"></canvas>
   <div id="trainstats"></div>
 </div>
 
@@ -305,15 +378,14 @@ function newGame(selfplay) {
   stopSelfplay();
   S.moves = []; S.legal = []; S.sel = null; S.over = false; S.selfplay = selfplay;
   S.userWhite = selfplay || document.getElementById("color").value === "white";
+  S.fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
   document.getElementById("notes").innerHTML = "";
   document.getElementById("sans").textContent = "";
-  renderBoard("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+  renderBoard(S.fen);
+  // hydrate from the server: fills legal moves; model replies if it's to move
+  sendMove(null, false);
   if (selfplay) {
     selfplayTimer = setInterval(() => { if (!S.busy && !S.over) sendMove(null, true); }, 500);
-  } else if (!S.userWhite) {
-    sendMove(null, false);   // model is white: it opens
-  } else {
-    setStatus("your move");
   }
 }
 
@@ -362,8 +434,50 @@ async function pollLog() {
     "  " + Math.round(last.tok_per_s).toLocaleString() + " tok/s";
 }
 
-loadRuns().then(() => { renderBoard(null); pollLog(); });
+async function pollProbes() {
+  if (!S.run) return;
+  try {
+    const d = await (await fetch("/api/probe?run=" + S.run)).json();
+    if (d.error || !d.latest) return;
+    const el = document.getElementById("probes");
+    let html = "";
+    for (const p of d.latest.probes) {
+      html += "<div class='probe'><b>" + p.label + "</b> <span class='pct'>(legal mass " +
+              (p.legal_mass * 100).toFixed(1) + "%)</span>";
+      for (const t of p.top) {
+        html += "<div class='row'><span class='mv" + (t.legal ? "" : " illegal") + "'>" +
+                t.move + (t.legal ? "" : " ✗") + "</span><div class='bar' style='width:" +
+                Math.max(1, Math.round(t.prob * 220)) + "px'></div><span class='pct'>" +
+                (t.prob * 100).toFixed(1) + "%</span></div>";
+      }
+      html += "</div>";
+    }
+    el.innerHTML = html;
+    drawMass(d.history);
+  } catch (e) {}
+}
+
+function drawMass(h) {
+  const c = document.getElementById("mass"), g = c.getContext("2d");
+  g.clearRect(0, 0, c.width, c.height);
+  if (!h.length) return;
+  const maxStep = h[h.length - 1].step || 1;
+  const x = s => 40 + (s / maxStep) * (c.width - 55);
+  const y = v => 8 + (1 - v) * (c.height - 30);
+  g.strokeStyle = "#5a9"; g.beginPath();
+  h.forEach((r, i) => i ? g.lineTo(x(r.step), y(r.avg_legal_mass)) : g.moveTo(x(r.step), y(r.avg_legal_mass)));
+  g.stroke();
+  g.fillStyle = "#5a9";
+  for (const r of h) { g.beginPath(); g.arc(x(r.step), y(r.avg_legal_mass), 2.5, 0, 7); g.fill(); }
+  g.fillStyle = "#999"; g.font = "11px sans-serif";
+  g.fillText("100%", 4, 14); g.fillText("0%", 4, c.height - 20);
+  const last = h[h.length - 1];
+  g.fillText((last.avg_legal_mass * 100).toFixed(1) + "% @ step " + last.step, c.width - 140, 14);
+}
+
+loadRuns().then(() => { renderBoard(null); pollLog(); pollProbes(); });
 setInterval(pollLog, 3000);
+setInterval(pollProbes, 5000);
 setInterval(loadRuns, 15000);
 </script></body></html>
 """
