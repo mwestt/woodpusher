@@ -51,6 +51,28 @@ def next_logits(model, ids, device):
     return logits[0, -1]
 
 
+def topk_report(logits, tok, board, k=5):
+    """Summarize the raw next-move distribution (no legality mask, temp 1).
+
+    Returns (probs, legal_mass, top): full softmax over the vocab, total
+    probability on legal moves, and the top-k entries as dicts with the
+    token id, SAN (or raw token text if illegal), probability, and legality.
+    """
+    probs = torch.softmax(logits.float(), dim=-1)
+    legal = {tok.move_id(m.uci()): m for m in board.legal_moves}
+    legal_mass = float(probs[list(legal)].sum())
+    top = []
+    for i in probs.argsort(descending=True)[:k].tolist():
+        is_legal = i in legal
+        top.append({
+            "id": i,
+            "move": board.san(legal[i]) if is_legal else tok.tokens[i],
+            "prob": float(probs[i]),
+            "legal": is_legal,
+        })
+    return probs, legal_mass, top
+
+
 def sampling_generator(device, seed):
     """Seeded torch.Generator for reproducible nonzero-temperature games."""
     if seed is None:
@@ -60,14 +82,16 @@ def sampling_generator(device, seed):
     return gen
 
 
-def pick_move(model, tok, ids, board, device, temperature=0.0, mask_legal=True, generator=None):
+def pick_move(model, tok, ids, board, device, temperature=0.0, mask_legal=True, generator=None, logits=None):
     """Choose the model's move for the current position.
 
     Returns (move, raw_argmax_token_id). `move` is a legal chess.Move when
     mask_legal, else whatever the raw choice decodes to (possibly None).
-    Pass a seeded `generator` to make temperature sampling reproducible.
+    Pass a seeded `generator` to make temperature sampling reproducible, and
+    `logits` to reuse an already-computed forward pass for this position.
     """
-    logits = next_logits(model, ids, device)
+    if logits is None:
+        logits = next_logits(model, ids, device)
     raw_id = int(logits.argmax())
 
     if mask_legal:

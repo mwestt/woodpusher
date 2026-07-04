@@ -1,14 +1,15 @@
-"""Local web UI: watch training live and play any checkpoint, on one page.
+"""Local web UI: play any checkpoint and watch its move distribution live.
 
     uv run python -m woodpusher.web            # then open http://localhost:8000
 
-Zero extra dependencies (stdlib server, hand-rolled board, canvas chart).
-Checkpoints are hot-reloaded when their file changes, so a model can be
-watched — and played — while it trains.
+Zero extra dependencies (stdlib server, hand-rolled board). Centered board
+with a scrolling prediction feed: for every position — before your moves and
+the model's — the raw top-k next-move distribution, with the played move
+highlighted and illegal candidates flagged. Checkpoints are hot-reloaded
+when their file changes.
 """
 
 import argparse
-import csv
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,22 +19,13 @@ from urllib.parse import parse_qs, urlparse
 import chess
 import torch
 
-from .evals.common import next_logits, pick_move
+from .evals.common import next_logits, pick_move, topk_report
 from .model import ModelConfig, Transformer
 from .tokenizer import Tokenizer
 
 TOK = Tokenizer()
 INFER_LOCK = threading.Lock()
 _model_cache: dict[str, tuple[float, object, int]] = {}
-
-# Fixed probe positions (move sequences from the start), polled against the
-# live checkpoint: watch beliefs sharpen as training runs.
-PROBES = [
-    ("opening choice", []),
-    ("reply to 1.e4", ["e2e4"]),
-    ("defend e5 as black", ["e2e4", "e7e5", "g1f3"]),
-    ("find Scholar's mate", ["e2e4", "e7e5", "f1c4", "f8c5", "d1h5", "g7g6"]),
-]
 
 
 def get_model(run_dir: Path, device: str):
@@ -57,28 +49,23 @@ def get_model(run_dir: Path, device: str):
     return model, step, mtime
 
 
-def compute_probes(model, device):
-    out = []
-    for label, moves in PROBES:
-        board = chess.Board()
-        for u in moves:
-            board.push(chess.Move.from_uci(u))
-        ids = TOK.prefix_ids(1800, 1800) + [TOK.move_id(u) for u in moves]
-        with INFER_LOCK:
-            logits = next_logits(model, ids, device)
-        probs = torch.softmax(logits.float(), dim=-1)
-        legal = {TOK.move_id(m.uci()): m for m in board.legal_moves}
-        legal_mass = float(probs[list(legal)].sum())
-        top = []
-        for i in probs.argsort(descending=True)[:5].tolist():
-            is_legal = i in legal
-            top.append({
-                "move": board.san(legal[i]) if is_legal else TOK.tokens[i],
-                "prob": float(probs[i]),
-                "legal": is_legal,
-            })
-        out.append({"label": label, "legal_mass": legal_mass, "top": top})
-    return out
+def pred_entry(logits, board, played_uci, mover, ply):
+    """Feed entry for one position: top-k of the raw distribution plus where
+    the actually-played move ranked. Computed before the move is pushed."""
+    probs, legal_mass, top = topk_report(logits, TOK, board)
+    played_id = TOK.move_id(played_uci)
+    return {
+        "ply": ply,
+        "mover": mover,
+        "san": board.san(chess.Move.from_uci(played_uci)),
+        "top": [
+            {"move": t["move"], "prob": t["prob"], "legal": t["legal"], "played": t["id"] == played_id}
+            for t in top
+        ],
+        "legal_mass": legal_mass,
+        "played_prob": float(probs[played_id]),
+        "played_rank": int((probs > probs[played_id]).sum()) + 1,
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -116,47 +103,6 @@ class Handler(BaseHTTPRequestHandler):
                     params = json.loads(meta_path.read_text()).get("params")
                 runs.append({"name": d.name, "params": params})
             self._json(runs)
-        elif url.path == "/api/probe":
-            try:
-                run = parse_qs(url.query).get("run", [""])[0]
-                run_dir = self.runs_dir / run
-                model, step, mtime = get_model(run_dir, self.device)
-                hist_path = run_dir / "probes.jsonl"
-                history = []
-                if hist_path.exists():
-                    history = [json.loads(line) for line in hist_path.read_text().splitlines() if line]
-                if not history or history[-1]["mtime"] != mtime:
-                    probes = compute_probes(model, self.device)
-                    entry = {
-                        "mtime": mtime,
-                        "step": step,
-                        "avg_legal_mass": sum(p["legal_mass"] for p in probes) / len(probes),
-                        "probes": probes,
-                    }
-                    with open(hist_path, "a") as f:
-                        f.write(json.dumps(entry) + "\n")
-                    history.append(entry)
-                self._json({
-                    "history": [{"step": h["step"], "avg_legal_mass": h["avg_legal_mass"]} for h in history],
-                    "latest": history[-1],
-                })
-            except Exception as e:
-                self._json({"error": f"{type(e).__name__}: {e}"}, 500)
-        elif url.path == "/api/log":
-            run = parse_qs(url.query).get("run", [""])[0]
-            log_path = self.runs_dir / run / "log.csv"
-            rows = []
-            if run and log_path.exists():
-                with open(log_path, newline="") as f:
-                    for r in csv.DictReader(f):
-                        rows.append({
-                            "step": int(r["step"]),
-                            "tokens": int(r["tokens"]),
-                            "train_loss": float(r["train_loss"]),
-                            "val_loss": float(r["val_loss"]) if r["val_loss"] else None,
-                            "tok_per_s": float(r["tok_per_s"]),
-                        })
-            self._json({"rows": rows})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -181,7 +127,24 @@ class Handler(BaseHTTPRequestHandler):
         your_elo = int(req.get("your_elo", 1600))
         temperature = float(req.get("temperature", 0.5))
 
-        error = note = None
+        if selfplay:
+            welo = belo = model_elo
+        else:
+            welo = your_elo if user_white else model_elo
+            belo = model_elo if user_white else your_elo
+        prefix = TOK.prefix_ids(welo, belo)
+        model = None
+
+        def logits_now():
+            nonlocal model
+            if model is None:
+                model, _, _ = get_model(self.runs_dir / req["run"], self.device)
+            ids = prefix + [TOK.move_id(u) for u in moves]
+            with INFER_LOCK:
+                return next_logits(model, ids, self.device)
+
+        error = None
+        preds = []
         user_move = req.get("user_move")
         if user_move and not board.is_game_over():
             mv = None
@@ -196,29 +159,17 @@ class Handler(BaseHTTPRequestHandler):
             if mv is None:
                 error = f"illegal move: {user_move}"
             else:
+                preds.append(pred_entry(logits_now(), board, mv.uci(), "you", len(moves)))
                 board.push(mv)
                 moves.append(mv.uci())
 
         if error is None and not board.is_game_over():
             model_turn = selfplay or ((board.turn == chess.WHITE) != user_white)
             if model_turn:
-                if selfplay:
-                    welo = belo = model_elo
-                else:
-                    welo = your_elo if user_white else model_elo
-                    belo = model_elo if user_white else your_elo
-                ids = TOK.prefix_ids(welo, belo) + [TOK.move_id(u) for u in moves]
-                model, _, _ = get_model(self.runs_dir / req["run"], self.device)
+                logits = logits_now()
                 with INFER_LOCK:
-                    mv, raw_id = pick_move(model, TOK, ids, board, self.device, temperature)
-                raw_ok = False
-                if TOK.is_move_id(raw_id):
-                    try:
-                        raw_ok = chess.Move.from_uci(TOK.tokens[raw_id]) in board.legal_moves
-                    except ValueError:
-                        pass
-                if not raw_ok:
-                    note = f"raw top-1 was illegal: {TOK.tokens[raw_id]}"
+                    mv, _ = pick_move(model, TOK, [], board, self.device, temperature, logits=logits)
+                preds.append(pred_entry(logits, board, mv.uci(), "model", len(moves)))
                 board.push(mv)
                 moves.append(mv.uci())
 
@@ -230,10 +181,10 @@ class Handler(BaseHTTPRequestHandler):
 
         return {
             "error": error,
-            "note": note,
             "fen": board.fen(),
             "moves": moves,
             "sans": sans,
+            "preds": preds,
             "legal": [m.uci() for m in board.legal_moves],
             "turn": "w" if board.turn == chess.WHITE else "b",
             "game_over": board.is_game_over(),
@@ -244,11 +195,12 @@ class Handler(BaseHTTPRequestHandler):
 PAGE = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>woodpusher</title>
 <style>
-  body { font-family: system-ui, sans-serif; background: #1e1e22; color: #ddd;
-         margin: 0; display: flex; gap: 24px; padding: 20px; flex-wrap: wrap; }
-  h1 { font-size: 18px; margin: 0 0 10px; } h2 { font-size: 14px; margin: 14px 0 6px; color: #aaa; }
+  body { font-family: system-ui, sans-serif; background: #1e1e22; color: #ddd; margin: 0;
+         display: flex; justify-content: center; align-items: flex-start;
+         gap: 28px; padding: 20px; flex-wrap: wrap; }
+  h1 { font-size: 18px; margin: 0 0 10px; } h2 { font-size: 14px; margin: 0 0 8px; color: #aaa; }
   #board { display: grid; grid-template-columns: repeat(8, 52px); user-select: none;
-           border: 2px solid #444; width: fit-content; }
+           border: 2px solid #444; width: fit-content; margin-top: 8px; }
   .sq { width: 52px; height: 52px; font-size: 38px; line-height: 52px; text-align: center; cursor: pointer; }
   .light { background: #f0d9b5; } .dark { background: #b58863; }
   .sel { outline: 3px solid #e8a33d; outline-offset: -3px; }
@@ -258,18 +210,20 @@ PAGE = r"""<!doctype html>
                           border-radius: 4px; padding: 4px 8px; margin: 2px; }
   button { cursor: pointer; } button:hover { background: #3a3a42; }
   #status { margin-top: 8px; min-height: 20px; color: #e8a33d; }
-  #notes { font-size: 12px; color: #888; max-height: 90px; overflow-y: auto; }
-  #sans { font-size: 13px; max-width: 420px; max-height: 120px; overflow-y: auto; color: #bbb; }
-  canvas { background: #26262c; border: 1px solid #444; }
-  #trainstats { font-size: 13px; color: #9c9; }
-  .panel { min-width: 430px; }
-  .probe { margin-bottom: 10px; font-size: 13px; }
-  .row { display: flex; align-items: center; gap: 6px; font-size: 12px; margin: 1px 0; }
-  .mv { width: 70px; } .illegal { color: #e66; }
+  #sans { font-size: 13px; max-width: 432px; max-height: 100px; overflow-y: auto; color: #bbb; }
+  #feedpanel { width: 340px; }
+  #feed { max-height: calc(100vh - 90px); overflow-y: auto; }
+  .entry { border-bottom: 1px solid #333; padding: 8px 4px; }
+  .ehead { font-size: 13px; margin-bottom: 4px; }
+  .who { color: #888; font-size: 11px; margin: 0 6px; text-transform: uppercase; }
+  .row { display: flex; align-items: center; gap: 6px; font-size: 12px; margin: 1px 0;
+         padding: 0 2px; border-radius: 3px; }
+  .row.played { background: rgba(232,163,61,.16); }
+  .mv { width: 62px; } .illegal { color: #e66; }
   .bar { height: 10px; background: #5a9; } .pct { color: #888; }
 </style></head><body>
 
-<div class="panel">
+<div>
   <h1>woodpusher</h1>
   <div>
     run <select id="run"></select>
@@ -286,18 +240,11 @@ PAGE = r"""<!doctype html>
   <div id="board"></div>
   <div id="status">pick a run and start a game</div>
   <div id="sans"></div>
-  <h2>model notes (raw top-1 legality)</h2>
-  <div id="notes"></div>
 </div>
 
-<div class="panel">
-  <h2>probes — what the model believes right now (✗ = illegal)</h2>
-  <div id="probes"></div>
-  <h2>legal probability mass over training (avg across probes)</h2>
-  <canvas id="mass" width="460" height="110"></canvas>
-  <h2>training loss</h2>
-  <canvas id="chart" width="460" height="160"></canvas>
-  <div id="trainstats"></div>
+<div id="feedpanel">
+  <h2>candidate moves (raw distribution, ✗ = illegal)</h2>
+  <div id="feed"></div>
 </div>
 
 <script>
@@ -350,6 +297,27 @@ function clickSquare(name, piece) {
   renderBoard(S.fen);
 }
 
+function pc(x) { return (x * 100).toFixed(1) + "%"; }
+
+function renderPred(p) {
+  const moveNo = Math.floor(p.ply / 2) + 1;
+  const num = p.ply % 2 === 0 ? moveNo + "." : moveNo + "…";
+  let html = "<div class='ehead'><b>" + num + " " + p.san + "</b>" +
+    "<span class='who'>" + p.mover + "</span>" +
+    "<span class='pct'>p " + pc(p.played_prob) + " · rank #" + p.played_rank +
+    " · legal mass " + pc(p.legal_mass) + "</span></div>";
+  for (const t of p.top) {
+    html += "<div class='row" + (t.played ? " played" : "") + "'>" +
+      "<span class='mv" + (t.legal ? "" : " illegal") + "'>" + t.move + (t.legal ? "" : " ✗") + "</span>" +
+      "<div class='bar' style='width:" + Math.max(1, Math.round(t.prob * 180)) + "px'></div>" +
+      "<span class='pct'>" + pc(t.prob) + "</span></div>";
+  }
+  const div = document.createElement("div");
+  div.className = "entry";
+  div.innerHTML = html;
+  return div;
+}
+
 async function sendMove(userMove, selfplayStep) {
   if (!S.run || S.busy) return;
   S.busy = true;
@@ -365,7 +333,8 @@ async function sendMove(userMove, selfplayStep) {
   S.busy = false;
   if (d.error) { setStatus(d.error); return; }
   S.moves = d.moves; S.legal = d.legal; S.fen = d.fen; S.over = d.game_over;
-  if (d.note) addNote(S.moves.length + ". " + d.note);
+  const feed = document.getElementById("feed");
+  for (const p of d.preds) feed.prepend(renderPred(p));
   document.getElementById("sans").textContent = d.sans.map((s, i) =>
     i % 2 === 0 ? Math.floor(i / 2 + 1) + ". " + s : s).join(" ");
   renderBoard(d.fen);
@@ -379,8 +348,8 @@ function newGame(selfplay) {
   S.moves = []; S.legal = []; S.sel = null; S.over = false; S.selfplay = selfplay;
   S.userWhite = selfplay || document.getElementById("color").value === "white";
   S.fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-  document.getElementById("notes").innerHTML = "";
   document.getElementById("sans").textContent = "";
+  document.getElementById("feed").innerHTML = "";
   renderBoard(S.fen);
   // hydrate from the server: fills legal moves; model replies if it's to move
   sendMove(null, false);
@@ -391,7 +360,6 @@ function newGame(selfplay) {
 
 function stopSelfplay() { if (selfplayTimer) clearInterval(selfplayTimer); selfplayTimer = null; S.selfplay = false; }
 function setStatus(t) { document.getElementById("status").textContent = t; }
-function addNote(t) { const n = document.getElementById("notes"); n.innerHTML = t + "<br>" + n.innerHTML; }
 
 async function loadRuns() {
   const runs = await (await fetch("/api/runs")).json();
@@ -408,76 +376,7 @@ async function loadRuns() {
   sel.onchange = () => { S.run = sel.value; };
 }
 
-async function pollLog() {
-  if (!S.run) return;
-  const d = await (await fetch("/api/log?run=" + S.run)).json();
-  const rows = d.rows;
-  const c = document.getElementById("chart"), g = c.getContext("2d");
-  g.clearRect(0, 0, c.width, c.height);
-  if (!rows.length) return;
-  const losses = rows.map(r => r.train_loss).concat(rows.filter(r => r.val_loss).map(r => r.val_loss));
-  const lo = Math.min(...losses), hi = Math.max(...losses);
-  const x = s => 40 + (s / rows[rows.length - 1].step) * (c.width - 55);
-  const y = l => 10 + (1 - (l - lo) / (hi - lo + 1e-9)) * (c.height - 40);
-  g.strokeStyle = "#666"; g.beginPath();
-  rows.forEach((r, i) => i ? g.lineTo(x(r.step), y(r.train_loss)) : g.moveTo(x(r.step), y(r.train_loss)));
-  g.stroke();
-  g.fillStyle = "#e8a33d";
-  for (const r of rows) if (r.val_loss) { g.beginPath(); g.arc(x(r.step), y(r.val_loss), 3, 0, 7); g.fill(); }
-  g.fillStyle = "#999"; g.font = "11px sans-serif";
-  g.fillText(hi.toFixed(2), 4, 16); g.fillText(lo.toFixed(2), 4, c.height - 34);
-  g.fillText("step " + rows[rows.length - 1].step, c.width - 80, c.height - 8);
-  const last = rows[rows.length - 1];
-  document.getElementById("trainstats").textContent =
-    "step " + last.step + "  train " + last.train_loss.toFixed(4) +
-    (last.val_loss ? "  val " + last.val_loss.toFixed(4) : "") +
-    "  " + Math.round(last.tok_per_s).toLocaleString() + " tok/s";
-}
-
-async function pollProbes() {
-  if (!S.run) return;
-  try {
-    const d = await (await fetch("/api/probe?run=" + S.run)).json();
-    if (d.error || !d.latest) return;
-    const el = document.getElementById("probes");
-    let html = "";
-    for (const p of d.latest.probes) {
-      html += "<div class='probe'><b>" + p.label + "</b> <span class='pct'>(legal mass " +
-              (p.legal_mass * 100).toFixed(1) + "%)</span>";
-      for (const t of p.top) {
-        html += "<div class='row'><span class='mv" + (t.legal ? "" : " illegal") + "'>" +
-                t.move + (t.legal ? "" : " ✗") + "</span><div class='bar' style='width:" +
-                Math.max(1, Math.round(t.prob * 220)) + "px'></div><span class='pct'>" +
-                (t.prob * 100).toFixed(1) + "%</span></div>";
-      }
-      html += "</div>";
-    }
-    el.innerHTML = html;
-    drawMass(d.history);
-  } catch (e) {}
-}
-
-function drawMass(h) {
-  const c = document.getElementById("mass"), g = c.getContext("2d");
-  g.clearRect(0, 0, c.width, c.height);
-  if (!h.length) return;
-  const maxStep = h[h.length - 1].step || 1;
-  const x = s => 40 + (s / maxStep) * (c.width - 55);
-  const y = v => 8 + (1 - v) * (c.height - 30);
-  g.strokeStyle = "#5a9"; g.beginPath();
-  h.forEach((r, i) => i ? g.lineTo(x(r.step), y(r.avg_legal_mass)) : g.moveTo(x(r.step), y(r.avg_legal_mass)));
-  g.stroke();
-  g.fillStyle = "#5a9";
-  for (const r of h) { g.beginPath(); g.arc(x(r.step), y(r.avg_legal_mass), 2.5, 0, 7); g.fill(); }
-  g.fillStyle = "#999"; g.font = "11px sans-serif";
-  g.fillText("100%", 4, 14); g.fillText("0%", 4, c.height - 20);
-  const last = h[h.length - 1];
-  g.fillText((last.avg_legal_mass * 100).toFixed(1) + "% @ step " + last.step, c.width - 140, 14);
-}
-
-loadRuns().then(() => { renderBoard(null); pollLog(); pollProbes(); });
-setInterval(pollLog, 3000);
-setInterval(pollProbes, 5000);
+loadRuns().then(() => renderBoard(null));
 setInterval(loadRuns, 15000);
 </script></body></html>
 """
