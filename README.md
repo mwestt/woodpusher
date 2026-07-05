@@ -97,7 +97,7 @@ uv run python -m woodpusher.evals.elo_vs_stockfish --ckpt runs/25m/best.pt --sto
 ## ♛ Project plan
 
 1. [x] Data pipeline + tokenizer
-2. [ ] 5M smoke-test model (`--preset 5m`, needs ~120M tokens, a 2015-era month)
+2. [ ] 5M smoke-test model (`--preset 5m`, needs ~120M tokens from the shared corpus)
 3. [ ] Eval harness validated on the 5M model; play against it
 4. [ ] Ladder runs + scaling plot (`5m` to `25m`, rematch at each rung)
 5. [ ] 100M Chinchilla run (~1.8B tokens, ~a day on one GPU)
@@ -105,17 +105,24 @@ uv run python -m woodpusher.evals.elo_vs_stockfish --ckpt runs/25m/best.pt --sto
 
 ## ♚ Scale & budget notes
 
-| Preset | Params | Chinchilla tokens | Data needed | Hardware |
-|---|---|---|---|---|
-| smoke | ~1M | (3M, not Chinchilla) | 2013-01 dump | local (RTX 4070) |
-| 5m | ~6M | 120M | ~1 month of 2015 | local (RTX 4070, ~minutes) |
-| 25m | ~28M | 560M | ~1 month of 2016-17 | local (RTX 4070, ~hours) |
-| 100m | ~90M | 1.8B | ~1 month of 2018+ | local overnight, or rented A100 for speed (~$30–60) |
+| Preset | Params | Chinchilla tokens | Hardware |
+|---|---|---|---|
+| smoke | ~1M | (3M, not Chinchilla) | local (RTX 4070) |
+| 5m | ~6M | 120M | local (RTX 4070, ~minutes) |
+| 25m | ~28M | 560M | local (RTX 4070, ~hours) |
+| 100m | ~90M | 1.8B | local overnight, or rented A100 for speed (~$30–60) |
 
-Rules of thumb: training compute ≈ 6·params·tokens FLOPs; compute-optimal
-runtime scales with params² (each rung is roughly 4× the last); a game
-averages ~70 tokens; one recent monthly dump ≈ 8–10B tokens, far more than
-any rung here needs, so `prepare.py --max-games` caps it.
+The 5m/25m/100m rungs all read **one shared corpus**, prepared once from a single
+recent Lichess month (BOT-filtered, with a held-out val/test split). Each rung
+draws its Chinchilla token budget from the same pool via the trainer's step count,
+so scaling comparisons hold the data distribution fixed and the held-out set is
+common across rungs. `smoke` uses the tiny 2013-01 dump for quick pipeline checks.
+
+Rules of thumb: training compute ≈ 6·params·tokens FLOPs; compute-optimal runtime
+scales with params² (each rung is roughly 4× the last); a game averages ~71 tokens
+(measured on recent data). A recent month is ~90–100M games; filtered to blitz+rapid
+it yields ~4B tokens, comfortably above the 100m rung's 1.8B, so one month covers the
+whole ladder single-epoch and `prepare.py --max-games` caps it.
 
 ## ♝ Evals
 
