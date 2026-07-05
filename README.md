@@ -6,7 +6,7 @@ Chess is usually considered solved by state-of-the-art RL engines like
 [AlphaZero](https://arxiv.org/abs/1712.01815), but treating it as a language-modelling problem
 opens up different lines of inquiry into what a transformer picks up from next-move prediction alone.
 Because a capable model at this scale stays small enough to train on a single GPU, it presents a
-convenient toy system for probing interpretability and scaling laws against a problem with space with clean ground truths.
+convenient toy system for probing interpretability and scaling laws against a problem space with clean ground truths.
 Longer-term directions include blending imitation pretraining with RL post-training.
 
 The name is an homage to John Hamlen's
