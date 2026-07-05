@@ -24,6 +24,44 @@ university research project, and which campaigned at World Computer Chess Champi
 | Tracking | CSV logs + matplotlib (`woodpusher/plot.py`) |
 | Data | [Lichess open database](https://database.lichess.org) monthly dumps |
 
+## ♖ Architecture
+
+woodpusher is a decoder-only autoregressive transformer in the modern Llama-style
+idiom, kept to a single file (`model.py`). The rest of the repo depends on it
+through one contract only: **token ids in, next-token logits out.** That interface
+is what keeps the sequence-mixing core swappable.
+
+Each layer runs on a pre-norm residual stream:
+
+1. RMSNorm, then causal multi-head self-attention with rotary position embeddings
+   (RoPE), added back to the stream.
+2. RMSNorm, then a SwiGLU MLP (hidden width about 8/3 of the model width, rounded
+   to a multiple of 64), added back.
+
+Other specifics: attention is PyTorch `scaled_dot_product_attention` (flash when
+available) with a causal mask and no biases; the token embedding is tied to the
+output projection; dropout is off by default; residual-output projections use the
+GPT-2 scaled init. Depth, width, and head count come from the ladder preset in
+`configs.py`; the vocabulary (~4.2k) is fixed by the tokenizer.
+
+**Held fixed (the controlled spine).** Constant across runs so that ladder and
+conditioning comparisons stay clean:
+
+- Move-level UCI tokenization (one move is one token, ~4.2k deterministic vocab)
+- Elo-bucket prefix conditioning (`<welo:B> <belo:B>`)
+- Decoder-only next-token objective, trained single-GPU with AdamW, bf16, and a warmup-then-cosine schedule
+- The eval harness (`illegal`, `mate_in_one`, `probes`, `elo_vs_stockfish`)
+
+**Open to experiment.** Knobs we expect to turn; the ids-to-logits interface keeps
+each isolated from the rest of the code:
+
+- Sequence-mixing block: a transformer today, but Mamba/SSM, RWKV, or MoE can drop in behind the same interface for architecture comparisons
+- Attention variant: multi-head now, group-query (GQA) later to cut KV-cache cost
+- Conditioning mechanism: discrete tokens vs continuous embeddings vs latent (no conditioning)
+- Tokenization granularity: move-level UCI vs character-level SAN
+- Scale: the smoke / 5m / 25m / 100m ladder
+- Post-training: RL on top of the imitation base
+
 ## ♞ Quickstart
 
 ```powershell
