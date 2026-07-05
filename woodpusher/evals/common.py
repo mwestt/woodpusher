@@ -21,10 +21,19 @@ def load_model(ckpt_path, device):
     return model, cfg
 
 
-def sample_val_games(data_dir, n, seed=0):
-    """Return up to n token-id lists (<bos>..<eos>) from val.bin."""
+def sample_games(data_dir, n, seed=0, split="test"):
+    """Return up to n token-id lists (<bos>..<eos>) from <split>.bin.
+
+    Evals default to the held-out test split (never used for checkpoint
+    selection); falls back to val.bin for older datasets prepared without one.
+    """
     tok = Tokenizer()
-    data = np.fromfile(Path(data_dir) / "val.bin", dtype=np.uint16)
+    path = Path(data_dir) / f"{split}.bin"
+    if not path.exists() and split == "test":
+        path = Path(data_dir) / "val.bin"
+    if not path.exists():
+        raise FileNotFoundError(f"no {split}.bin (or val.bin fallback) in {data_dir}")
+    data = np.fromfile(path, dtype=np.uint16)
     bos = np.flatnonzero(data == tok.bos_id)
     eos = np.flatnonzero(data == tok.eos_id)
     games, j = [], 0

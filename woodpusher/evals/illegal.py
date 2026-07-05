@@ -13,7 +13,7 @@ import chess
 import torch
 
 from ..tokenizer import Tokenizer
-from .common import game_moves, load_model, next_logits, sample_val_games
+from .common import game_moves, load_model, next_logits, sample_games
 
 
 def main():
@@ -21,13 +21,14 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--positions", type=int, default=1000)
+    ap.add_argument("--split", default="test", help="held-out split to sample (test/val)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     tok = Tokenizer()
     model, _ = load_model(args.ckpt, args.device)
-    games = sample_val_games(args.data_dir, args.positions, args.seed)
+    games = sample_games(args.data_dir, args.positions, args.seed, args.split)
     rng = random.Random(args.seed)
 
     n = well_formed = legal = 0

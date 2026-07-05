@@ -64,6 +64,9 @@ def main():
     ap.add_argument("--val-interval", type=int, default=250)
     ap.add_argument("--val-iters", type=int, default=50)
     ap.add_argument("--ckpt-interval", type=int, default=1000)
+    ap.add_argument("--snapshot-interval", type=int, default=0,
+                    help="also keep a weights-only snapshot every N steps (0 = off); "
+                         "never overwritten, for probing training dynamics")
     ap.add_argument("--log-interval", type=int, default=20)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--seed", type=int, default=1337)
@@ -140,6 +143,14 @@ def main():
             "best_val": best_val,
         }, path)
 
+    def save_snapshot(step):
+        # weights-only (no optimizer): for post-hoc probing, not resuming
+        torch.save({
+            "model": model.state_dict(),
+            "model_config": asdict(cfg),
+            "step": step,
+        }, out_dir / f"snap_{step:06d}.pt")
+
     print(f"preset={args.preset} params={model.num_params():,} device={args.device}")
     print(f"steps={max_steps:,} tokens/step={tokens_per_step:,} "
           f"total tokens={max_steps * tokens_per_step:,} (data has {len(train_data):,})")
@@ -186,6 +197,8 @@ def main():
 
         if (step + 1) % args.ckpt_interval == 0 or step + 1 == max_steps:
             save(ckpt_path, step + 1)
+        if args.snapshot_interval and (step + 1) % args.snapshot_interval == 0:
+            save_snapshot(step + 1)
 
     print(f"done. best val loss {best_val:.4f}; checkpoints in {out_dir}")
 
