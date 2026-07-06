@@ -10,6 +10,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import time
 from contextlib import nullcontext
 from dataclasses import asdict
@@ -134,8 +135,15 @@ def main():
     if not log_path.exists():
         log_path.write_text("step,tokens,train_loss,val_loss,lr,tok_per_s\n")
 
+    def atomic_save(obj, path):
+        # write to a temp file then rename: a kill mid-save can never leave a
+        # torn ckpt.pt (os.replace is atomic on the same filesystem)
+        tmp = path.parent / (path.name + ".tmp")
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+
     def save(path, step):
-        torch.save({
+        atomic_save({
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "model_config": asdict(cfg),
@@ -145,7 +153,7 @@ def main():
 
     def save_snapshot(step):
         # weights-only (no optimizer): for post-hoc probing, not resuming
-        torch.save({
+        atomic_save({
             "model": model.state_dict(),
             "model_config": asdict(cfg),
             "step": step,
