@@ -101,7 +101,11 @@ def main():
             break
         with open_pgn(Path(pgn_path)) as stream:
             while True:
-                game = chess.pgn.read_game(stream)
+                try:
+                    game = chess.pgn.read_game(stream)
+                except Exception as e:  # truncated/corrupt stream (e.g. partial download)
+                    print(f"\nstream error in {pgn_path} ({type(e).__name__}); stopping this file")
+                    break
                 if game is None:
                     break
                 pbar.update(1)
