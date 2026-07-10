@@ -40,10 +40,10 @@ def main():
         label = f"{run_dir.name} ({meta['params'] / 1e6:.1f}M)"
         tokens = [int(r["tokens"]) for r in rows]
         train = [float(r["train_loss"]) for r in rows]
-        ax.plot(tokens, train, alpha=0.4)
+        line, = ax.plot(tokens, train, alpha=0.4)
         val_pts = [(int(r["tokens"]), float(r["val_loss"])) for r in rows if r["val_loss"]]
         if val_pts:
-            ax.plot(*zip(*val_pts), marker="o", markersize=3, label=label)
+            ax.plot(*zip(*val_pts), marker="o", markersize=3, label=label, color=line.get_color())
             scaling.append((meta["params"], min(v for _, v in val_pts), run_dir.name))
     ax.set_xscale("log")
     ax.set_xlabel("training tokens")
