@@ -115,10 +115,15 @@ def pick_move(model, tok, ids, board, device, temperature=0.0, mask_legal=True, 
             chosen = int(torch.multinomial(probs, 1, generator=generator))
         return legal[chosen], raw_id
 
-    if not tok.is_move_id(raw_id):
+    if temperature <= 0:
+        chosen = raw_id
+    else:
+        probs = torch.softmax(logits / temperature, dim=-1)
+        chosen = int(torch.multinomial(probs, 1, generator=generator))
+    if not tok.is_move_id(chosen):
         return None, raw_id
     try:
-        move = chess.Move.from_uci(tok.tokens[raw_id])
+        move = chess.Move.from_uci(tok.tokens[chosen])
     except ValueError:
         return None, raw_id
     return (move if move in board.legal_moves else None), raw_id
