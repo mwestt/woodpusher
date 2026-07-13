@@ -29,8 +29,7 @@ university research project, and which campaigned at World Computer Chess Champi
 
 woodpusher is a decoder-only autoregressive transformer in the modern Llama-style
 idiom, kept to a single file (`model.py`). The rest of the repo depends on it
-through one contract only: **token ids in, next-token logits out.** That interface
-is what keeps the sequence-mixing core swappable.
+through one contract only: token ids in, next-token logits out.
 
 Each layer runs on a pre-norm residual stream:
 
