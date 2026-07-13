@@ -1,7 +1,8 @@
 # ♟️ woodpusher
 
 Woodpusher is a language model that learns chess purely by reading text-encoded games, built from
-scratch as a hands-on way to work through the full foundation-model lifecycle, albeit at hobbyist scale.
+scratch as a hands-on way to work through the full foundation-model lifecycle, at hobbyist scale.
+
 Chess is usually considered solved by state-of-the-art RL engines like
 [AlphaZero](https://arxiv.org/abs/1712.01815), but treating it as a language-modelling problem
 opens up different lines of inquiry into what a transformer picks up from next-move prediction alone.
